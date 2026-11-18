@@ -10,11 +10,13 @@ infer_seg_ncnn.py — ต้นแบบ infer Day 2 (YOLO-seg NCNN · ncnn + nu
   - seg_mask uint16 PNG บีบอัดระดับ 1 · vis เป็น JPEG ย่อ --vis-scale
 error ที่หยุดทั้งรัน (exit 1): input/weights ไม่พบ · ไม่มีภาพ · อ่านภาพไม่ได้ · ผลผิดรูปแบบ
 
-  python toolkit/infer_seg_ncnn.py --input <ภาพ> --weights <โฟลเดอร์ NCNN> --out <ใหม่> \
+ตัวส่ง: ค่าเริ่ม = refine color band 20 + เขียนทับ --out ได้ → python infer_fast.py --input test/ --weights weights/ --out outputs/
+  python infer_fast.py --input <ภาพ> --weights <โฟลเดอร์ NCNN> --out <โฟลเดอร์> \
       --conf 0.25 --iou 0.7 --agnostic 1 --refine none --threads 4
 """
 import argparse
 import json
+import shutil
 import statistics
 import sys
 import time
@@ -211,11 +213,13 @@ def main():
     ap.add_argument("--agnostic", type=int, choices=[0, 1], default=1)
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--min-area", type=int, default=50, help="px ภาพเต็ม · ก้อนเล็กกว่านี้ไม่นับเป็นเม็ด")
-    ap.add_argument("--refine", choices=["none", "color"], default="none")
-    ap.add_argument("--band", type=int, default=6, help="(refine color) ความกว้างแถบขอบ px ภาพเต็ม")
+    ap.add_argument("--refine", choices=["none", "color"], default="color")
+    ap.add_argument("--band", type=int, default=20, help="(refine color) ความกว้างแถบขอบ px ภาพเต็ม")
     ap.add_argument("--fg-dist", type=float, default=18.0, help="(refine color) ระยะ Lab จากกระดาษที่นับเป็นเม็ด")
     ap.add_argument("--shadow-chroma", type=float, default=6.0, help="(refine color) เทาใกล้กระดาษ = เงา")
     ap.add_argument("--vis-scale", type=float, default=0.5)
+    ap.add_argument("--allow-existing-out", type=int, choices=[0, 1], default=1,
+                    help="1 = --out มีอยู่แล้วได้ (ลบ seg_mask/ vis/ predictions.json เดิมแล้วเขียนใหม่)")
     a = ap.parse_args()
 
     if not a.input.exists():
@@ -229,8 +233,19 @@ def main():
     stems = [p.stem.casefold() for p in files]
     if len(set(stems)) != len(stems):
         raise SystemExit("Error: ชื่อภาพ (stem) ซ้ำกัน")
+    if a.out.exists() and not a.out.is_dir():
+        raise SystemExit(f"Error: --out ไม่ใช่โฟลเดอร์: {a.out}")
     if a.out.exists() and any(a.out.iterdir()):
-        raise SystemExit(f"Error: --out ต้องเป็นโฟลเดอร์ใหม่หรือว่าง: {a.out}")
+        if not a.allow_existing_out:
+            raise SystemExit(f"Error: --out ต้องเป็นโฟลเดอร์ใหม่หรือว่าง: {a.out}")
+        if a.input.resolve() == a.out.resolve() or a.out.resolve() in a.input.resolve().parents:
+            raise SystemExit("Error: --out ซ้อนกับ --input")
+        # ลบเฉพาะผลเดิมของสคริปต์นี้ (seg_mask/, vis/, predictions.json) ไม่แตะไฟล์อื่น
+        for sub in ("seg_mask", "vis"):
+            if (a.out / sub).is_dir():
+                shutil.rmtree(a.out / sub)
+        (a.out / "predictions.json").unlink(missing_ok=True)
+        print(f"เขียนทับผลเดิมใน {a.out}", flush=True)
     cv2.setNumThreads(a.threads)
     net, imgsz = load_model(a.weights, a.threads)
     (a.out / "seg_mask").mkdir(parents=True, exist_ok=True)
@@ -252,7 +267,18 @@ def main():
         dt = time.perf_counter() - t0
         times.append(dt)
         print(f"[{i}/{len(files)}] {f.name}: {len(objects)} เม็ด {dt:.2f} s", flush=True)
-    (a.out / "predictions.json").write_text(json.dumps(preds, ensure_ascii=False), encoding="utf-8")
+    target = a.out / "predictions.json"
+    with target.open("w", encoding="utf-8") as fp:  # รูปแบบเดียวกับ infer.py เพื่อน: 1 ภาพ/1 เม็ด ต่อบรรทัด
+        fp.write("[\n")
+        for i, p in enumerate(preds):
+            fp.write('  {\n    "image_name": ' + json.dumps(p["image_name"], ensure_ascii=False)
+                     + ',\n    "objects": [')
+            for j, o in enumerate(p["objects"]):
+                fp.write(("\n" if j == 0 else ",\n") + "      " + json.dumps(o, ensure_ascii=False, allow_nan=False))
+            fp.write(("\n    " if p["objects"] else "") + "]\n  }" + (",\n" if i + 1 < len(preds) else "\n"))
+        fp.write("]\n")
+    if json.loads(target.read_text(encoding="utf-8")) != preds:
+        raise SystemExit("Error: predictions.json อ่านกลับไม่ตรงกับผล")
     print(f"บันทึก {len(files)} ภาพ → {a.out} · median {statistics.median(times):.2f} s/ภาพ "
           f"(รวมอ่าน/เขียน ไม่รวมโหลดโมเดล) · imgsz {imgsz} conf {a.conf} iou {a.iou} "
           f"agnostic {a.agnostic} refine {a.refine}")
