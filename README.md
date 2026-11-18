@@ -7,8 +7,8 @@ Model: YOLO26n-seg fine-tuned, exported to NCNN fp32 640 · inference uses only 
 
 | Path | What |
 |---|---|
-| `infer_fast.py` | **Recommended inference** — fast, never aborts on mask holes, refines mask edges with image colour (default) |
-| `infer.py` | Earlier inference script (same model input/output; slower, aborts on some mask holes) |
+| `infer.py` | **Inference (submission)** — fast, never aborts on mask holes, refines mask edges with image colour (default) |
+| `infer_old.py` | Earlier inference script kept for reference (slower, aborts on some mask holes) — not used |
 | `train.py` | Reproduces `weights/best.pt` (2 training stages + NCNN export) |
 | `weights/best.pt` | Trained model (stage-2 `last.pt`, md5 `76628505935e23a38a835a87faf26ed5`) |
 | `weights/best_ncnn_model/` | NCNN export used by inference (`model.ncnn.param/.bin`, `metadata.yaml`, imgsz 640) |
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ## Run inference
 
 ```bash
-python infer_fast.py --input test/ --weights weights/ --out outputs/
+python infer.py --input test/ --weights weights/ --out outputs/
 ```
 
 - `--input`: image file or folder (searched recursively; `.jpg .jpeg .png`, EXIF orientation applied)
