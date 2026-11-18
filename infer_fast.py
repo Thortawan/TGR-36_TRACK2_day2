@@ -10,7 +10,7 @@ infer_seg_ncnn.py — ต้นแบบ infer Day 2 (YOLO-seg NCNN · ncnn + nu
   - seg_mask uint16 PNG บีบอัดระดับ 1 · vis เป็น JPEG ย่อ --vis-scale
 error ที่หยุดทั้งรัน (exit 1): input/weights ไม่พบ · ไม่มีภาพ · อ่านภาพไม่ได้ · ผลผิดรูปแบบ
 
-ตัวส่ง: ค่าเริ่ม = refine color band 20 + เขียนทับ --out ได้ → python infer_fast.py --input test/ --weights weights/ --out outputs/
+ตัวส่ง: ค่าเริ่ม = refine color band 20 (distance transform) + เขียนทับ --out ได้ → python infer_fast.py --input test/ --weights weights/ --out outputs/
   python infer_fast.py --input <ภาพ> --weights <โฟลเดอร์ NCNN> --out <โฟลเดอร์> \
       --conf 0.25 --iou 0.7 --agnostic 1 --refine none --threads 4
 """
@@ -155,7 +155,12 @@ def predict(net, imgsz, rgb, a):
             dist = np.sqrt(((lab - paper) ** 2).sum(-1))
             chroma = np.sqrt(((lab[..., 1:] - paper[1:]) ** 2).sum(-1))
             fg = (dist > a.fg_dist) & ~((chroma < a.shadow_chroma) & (lab[..., 0] > paper[0] - 60))
-            band = cv2.dilate(m, kband).astype(bool) & ~cv2.erode(m, kband).astype(bool)
+            if a.band_method == "dt":  # ระยะถึงขอบด้วย distance transform (เร็วกว่าวงรี ~9 เท่า)
+                din = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+                dout = cv2.distanceTransform(1 - m, cv2.DIST_L2, 5)
+                band = (din <= a.band + 0.5) & (dout <= a.band + 0.5)
+            else:
+                band = cv2.dilate(m, kband).astype(bool) & ~cv2.erode(m, kband).astype(bool)
             m = np.where(band, fg, m.astype(bool)).astype(np.uint8)
         owned = inst[y1:y2, x1:x2] != 0
         m[owned] = 0
@@ -215,6 +220,8 @@ def main():
     ap.add_argument("--min-area", type=int, default=50, help="px ภาพเต็ม · ก้อนเล็กกว่านี้ไม่นับเป็นเม็ด")
     ap.add_argument("--refine", choices=["none", "color"], default="color")
     ap.add_argument("--band", type=int, default=20, help="(refine color) ความกว้างแถบขอบ px ภาพเต็ม")
+    ap.add_argument("--band-method", choices=["morph", "dt"], default="dt",
+                    help="(refine color) แถบขอบด้วย dilate/erode วงรี (morph) หรือ distance transform (dt เร็วกว่า)")
     ap.add_argument("--fg-dist", type=float, default=18.0, help="(refine color) ระยะ Lab จากกระดาษที่นับเป็นเม็ด")
     ap.add_argument("--shadow-chroma", type=float, default=6.0, help="(refine color) เทาใกล้กระดาษ = เงา")
     ap.add_argument("--vis-scale", type=float, default=0.5)
