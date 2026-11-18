@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     "max_nms": 30000,
     "mask_threshold": 0.5,
     "min_area": 3,                # component pixels at ORIGINAL image size
-    "hole_policy": "error",       # or "fill", an explicit, logged mask modification
+    "hole_policy": "fill",        # fill interior holes, logging each mask modification
 }
 
 
@@ -40,6 +40,8 @@ def parse_args():
     p.add_argument("--weights", required=True, type=Path, help="Folder with a YOLO NCNN segmenter")
     p.add_argument("--out", required=True, type=Path, help="New or empty output folder")
     p.add_argument("--threads", type=int, default=4, help="CPU threads (default: 4)")
+    p.add_argument("--hole-policy", choices=("fill", "error"), default=None,
+                   help="Override config: fill interior mask holes, or reject them")
     args = p.parse_args()
     if args.threads < 1:
         p.error("--threads must be positive")
@@ -363,7 +365,8 @@ def add_components(m, instances, objects, name, mask):
         if not np.array_equal(raster, region):
             if cfg["hole_policy"] == "error":
                 raise ValueError(f"{name} mask has holes that one polygon cannot represent. "
-                                 "Set hole_policy='fill' in config.json only if intentional.")
+                                 "Use --hole-policy fill to fill interior holes in both "
+                                 "the mask and polygon.")
             added = (raster != 0) & (region == 0)
             occupied = instances[y:y + h, x:x + w] != 0
             others = (labels[y:y + h, x:x + w] != 0) & (region == 0)
@@ -488,6 +491,8 @@ def run(args):
     images = collect_images(source)
     check_output(source, weights, output, images)
     model = load_models(weights, args.threads)
+    if args.hole_policy is not None:
+        model["cfg"]["hole_policy"] = args.hole_policy
     output.mkdir(parents=True, exist_ok=True)
     (output / "seg_mask").mkdir()
     (output / "vis").mkdir()
