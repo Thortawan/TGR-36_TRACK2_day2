@@ -23,7 +23,8 @@ DEFAULT_CONFIG = {
     "norm_scale": 1.0,            # optional training-data LANCZOS downscale
     "norm_quality": None,         # optional training-data JPEG quality
     "conf": 0.25,
-    "iou": 0.5,                   # class-aware box NMS
+    "iou": 0.5,
+    "agnostic_nms": True,         # one bean must not survive under two class labels
     "max_det": 1000,
     "max_nms": 30000,
     "mask_threshold": 0.5,
@@ -114,6 +115,8 @@ def validate_config(cfg):
     cfg["imgsz"] = size
     if cfg["hole_policy"] not in {"error", "fill"}:
         raise ValueError("hole_policy must be 'error' or 'fill'")
+    if type(cfg["agnostic_nms"]) is not bool:
+        raise ValueError("agnostic_nms must be true or false")
     for key in ("input_name", "output_name", "proto_name"):
         if not isinstance(cfg[key], str) or not cfg[key]:
             raise ValueError(f"{key} must be a nonempty NCNN blob name")
@@ -271,7 +274,7 @@ def restore_plane(m, plane, g):
                           borderMode=cv2.BORDER_REPLICATE)
 
 
-def nms(np, boxes, scores, classes, threshold, max_det):
+def nms(np, boxes, scores, classes, threshold, max_det, agnostic=False):
     order = np.argsort(-scores, kind="stable")
     area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     keep = []
@@ -282,7 +285,8 @@ def nms(np, boxes, scores, classes, threshold, max_det):
         intersection = np.maximum(0, np.minimum(boxes[i, 2:], boxes[rest, 2:]) -
                                   np.maximum(boxes[i, :2], boxes[rest, :2])).prod(axis=1)
         overlap = intersection / np.maximum(area[i] + area[rest] - intersection, 1e-9)
-        order = rest[(classes[rest] != classes[i]) | (overlap <= threshold)]
+        order = rest[(overlap <= threshold) if agnostic else
+                     ((classes[rest] != classes[i]) | (overlap <= threshold))]
     return np.asarray(keep, dtype=np.int64)
 
 
@@ -313,7 +317,8 @@ def yolo_candidates(m, outputs, g):
     rows = pred[:, indices].T
     boxes = np.concatenate((rows[:, :2] - rows[:, 2:4] / 2,
                             rows[:, :2] + rows[:, 2:4] / 2), axis=1)
-    keep = nms(np, boxes, scores[indices], classes[indices], cfg["iou"], cfg["max_det"])
+    keep = nms(np, boxes, scores[indices], classes[indices], cfg["iou"], cfg["max_det"],
+               agnostic=cfg["agnostic_nms"])
     threshold = math.log(cfg["mask_threshold"] / (1 - cfg["mask_threshold"]))
     for k in keep:
         logits = (rows[k, 4 + nc:] @ proto.reshape(nm, -1)).reshape(ph, pw)
@@ -430,6 +435,20 @@ def save_outputs(m, output, path, image, instances, objects):
     foreground = instances != 0
     rgb[foreground] = (rgb[foreground].astype(np.uint16) +
                        palette[instances[foreground]].astype(np.uint16)) // 2
+    cv2 = m["cv2"]
+    font_scale = max(0.4, max(image.size) / 2500)
+    thickness = max(1, round(font_scale * 2))
+    for obj in objects:
+        points = np.asarray(obj["polygon"], dtype=np.int32)
+        x, y = points.min(axis=0).tolist()
+        label = f"{obj['id']}: {obj['class']}"
+        (_, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                        font_scale, thickness)
+        origin = (x, max(text_h + thickness, y - thickness * 2))
+        cv2.putText(rgb, label, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(rgb, label, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    (255, 255, 255), thickness, cv2.LINE_AA)
     Image.fromarray(rgb).save(output / "vis" / f"{path.stem}.png")
 
 
@@ -487,7 +506,18 @@ def run(args):
               flush=True)
     target = output / "predictions.json"
     with target.open("w", encoding="utf-8") as stream:
-        json.dump(predictions, stream, ensure_ascii=False, allow_nan=False)
+        # Keep full polygon precision, with each image/object on its own line.
+        stream.write("[\n")
+        for i, prediction in enumerate(predictions):
+            stream.write("  {\n    \"image_name\": " +
+                         json.dumps(prediction["image_name"], ensure_ascii=False) +
+                         ",\n    \"objects\": [")
+            for j, obj in enumerate(prediction["objects"]):
+                stream.write(("\n" if j == 0 else ",\n") + "      " +
+                             json.dumps(obj, ensure_ascii=False, allow_nan=False))
+            stream.write(("\n    " if prediction["objects"] else "") + "]\n  }")
+            stream.write(",\n" if i + 1 < len(predictions) else "\n")
+        stream.write("]")
         stream.write("\n")
     if read_json(target) != predictions or len(predictions) != len(images):
         raise RuntimeError("predictions.json failed validation")
