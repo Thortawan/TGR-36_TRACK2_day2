@@ -1,0 +1,5 @@
+﻿ncnn
+numpy
+pillow
+opencv-python-headless
+PyYAML
