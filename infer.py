@@ -10,7 +10,7 @@ infer_seg_ncnn.py — ต้นแบบ infer Day 2 (YOLO-seg NCNN · ncnn + nu
   - seg_mask uint16 PNG บีบอัดระดับ 1 · vis เป็น JPEG ย่อ --vis-scale
 error ที่หยุดทั้งรัน (exit 1): input/weights ไม่พบ · ไม่มีภาพ · อ่านภาพไม่ได้ · ผลผิดรูปแบบ
 
-ตัวส่ง: ค่าเริ่ม = refine color band 20 (distance transform) + เขียนทับ --out ได้ → python infer.py --input test/ --weights weights/ --out outputs/
+ตัวส่ง: ค่าเริ่ม = refine color band 20 (distance transform) + เขียนไฟล์เบื้องหลัง + เขียนทับ --out ได้ → python infer.py --input test/ --weights weights/ --out outputs/
   python infer.py --input <ภาพ> --weights <โฟลเดอร์ NCNN> --out <โฟลเดอร์> \
       --conf 0.25 --iou 0.7 --agnostic 1 --refine none --threads 4
 """
@@ -20,6 +20,7 @@ import shutil
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -225,6 +226,8 @@ def main():
     ap.add_argument("--fg-dist", type=float, default=18.0, help="(refine color) ระยะ Lab จากกระดาษที่นับเป็นเม็ด")
     ap.add_argument("--shadow-chroma", type=float, default=6.0, help="(refine color) เทาใกล้กระดาษ = เงา")
     ap.add_argument("--vis-scale", type=float, default=0.5)
+    ap.add_argument("--async-write", type=int, choices=[0, 1], default=1,
+                    help="1 = เขียน seg_mask/vis ในเธรดเบื้องหลังขณะทายภาพถัดไป (ผลเหมือนเดิมทุกไบต์)")
     ap.add_argument("--allow-existing-out", type=int, choices=[0, 1], default=1,
                     help="1 = --out มีอยู่แล้วได้ (ลบ seg_mask/ vis/ predictions.json เดิมแล้วเขียนใหม่)")
     a = ap.parse_args()
@@ -259,21 +262,53 @@ def main():
     (a.out / "vis").mkdir(exist_ok=True)
     run_net(net, np.full((imgsz[0], imgsz[1], 3), 114, np.uint8))  # warm-up
     preds, times = [], []
+
+    def write_outputs(stem, rgb, inst):
+        if not cv2.imwrite(str(a.out / "seg_mask" / f"{stem}.png"), inst, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+            raise RuntimeError(f"เขียน seg_mask ไม่ได้ {stem}")
+        save_vis(a.out / "vis" / f"{stem}.jpg", rgb, inst, a.vis_scale)
+
+    # --async-write 1: เขียนไฟล์ภาพก่อนหน้าในเธรดเบื้องหลัง ขณะอ่าน/ทายภาพถัดไป (cv2.imwrite ปล่อย GIL)
+    # ไฟล์ผลเหมือนโหมดปกติทุกไบต์ · คิวไม่เกิน 2 ภาพ · เวลารายภาพ = ช่วงห่างระหว่างภาพ (รวมรอเขียนตอนท้าย)
+    pool = ThreadPoolExecutor(max_workers=1) if a.async_write else None
+    pending, starts = [], []
+
+    def drain(keep):
+        while len(pending) > keep:
+            try:
+                pending.pop(0).result()
+            except Exception as e:  # noqa: BLE001
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise SystemExit(f"Error: {e}")
+
     for i, f in enumerate(files, 1):
         t0 = time.perf_counter()
+        starts.append(t0)
         try:
             with Image.open(f) as im:
                 rgb = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
         except Exception as e:  # noqa: BLE001
             raise SystemExit(f"Error: อ่านภาพไม่ได้ {f.name}: {e}")
         inst, objects = predict(net, imgsz, rgb, a)
-        if not cv2.imwrite(str(a.out / "seg_mask" / f"{f.stem}.png"), inst, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
-            raise SystemExit(f"Error: เขียน seg_mask ไม่ได้ {f.stem}")
-        save_vis(a.out / "vis" / f"{f.stem}.jpg", rgb, inst, a.vis_scale)
+        if pool:
+            drain(1)
+            pending.append(pool.submit(write_outputs, f.stem, rgb, inst))
+        else:
+            try:
+                write_outputs(f.stem, rgb, inst)
+            except RuntimeError as e:
+                raise SystemExit(f"Error: {e}")
         preds.append({"image_name": f.name, "objects": objects})
         dt = time.perf_counter() - t0
-        times.append(dt)
-        print(f"[{i}/{len(files)}] {f.name}: {len(objects)} เม็ด {dt:.2f} s", flush=True)
+        if not pool:
+            times.append(dt)
+        print(f"[{i}/{len(files)}] {f.name}: {len(objects)} เม็ด {dt:.2f} s"
+              + (" (ไม่รวมเขียนไฟล์ที่ทำเบื้องหลัง)" if pool else ""), flush=True)
+    if pool:
+        drain(0)
+        pool.shutdown(wait=True)
+        ends = starts[1:] + [time.perf_counter()]
+        times = [e - s for s, e in zip(starts, ends)]
     target = a.out / "predictions.json"
     with target.open("w", encoding="utf-8") as fp:  # รูปแบบเดียวกับ infer.py เพื่อน: 1 ภาพ/1 เม็ด ต่อบรรทัด
         fp.write("[\n")
@@ -288,7 +323,7 @@ def main():
         raise SystemExit("Error: predictions.json อ่านกลับไม่ตรงกับผล")
     print(f"บันทึก {len(files)} ภาพ → {a.out} · median {statistics.median(times):.2f} s/ภาพ "
           f"(รวมอ่าน/เขียน ไม่รวมโหลดโมเดล) · imgsz {imgsz} conf {a.conf} iou {a.iou} "
-          f"agnostic {a.agnostic} refine {a.refine}")
+          f"agnostic {a.agnostic} refine {a.refine}" + (" · async-write" if pool else ""))
 
 
 if __name__ == "__main__":
